@@ -1,0 +1,636 @@
+import { randomBytes } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { Profile, ProfileCatalog, ProfileName } from "./profiles.ts";
+import {
+  boundText,
+  type ParentLaunchSnapshot,
+  RpcChild,
+  type SettlementEvent,
+} from "./rpc-child.ts";
+
+export type RunState =
+  | "starting"
+  | "running"
+  | "idle"
+  | "failed"
+  | "timedout"
+  | "blocked"
+  | "stopped";
+
+export type NextAction = "wait" | "inspect/retry" | "send" | "stop" | "retained-cleanup";
+
+export interface RunSnapshot {
+  id: string;
+  profile: ProfileName;
+  state: RunState;
+  generation: number;
+  cwd: string;
+  output: string;
+  partial: boolean;
+  error?: string;
+  reason?: string;
+  transcriptPath: string;
+  needsStop: boolean;
+  nextAction: NextAction;
+}
+
+export interface StatusResult {
+  runs: RunSnapshot[];
+  waitTimedOut?: boolean;
+}
+
+export interface StopResult {
+  id: string;
+  ok: boolean;
+  state?: RunState;
+  error?: string;
+  transcriptPath?: string;
+  retained?: boolean;
+  nextAction?: NextAction;
+}
+
+export interface RuntimeOptions {
+  catalog: ProfileCatalog;
+  parentSessionId: string;
+  transcriptRoot?: string;
+  executable?: string;
+  createChild?: typeof RpcChild.start;
+  now?: () => number;
+  onChange?: () => void;
+  closeViewer?: (runId: string) => Promise<void> | void;
+  defaultExecutionTimeoutMs?: number;
+  stopGraceMs?: number;
+}
+
+interface RunRecord {
+  id: string;
+  profile: ProfileName;
+  cwd: string;
+  state: RunState;
+  generation: number;
+  transcriptPath: string;
+  systemPromptFile: string;
+  output: string;
+  partial: boolean;
+  error?: string;
+  reason?: string;
+  child?: RpcChild;
+  executionTimer?: ReturnType<typeof setTimeout>;
+  executionDeadlineMs?: number;
+  queue: Promise<void>;
+  retainedTranscript?: boolean;
+}
+
+const ACTIVE = new Set<RunState>(["starting", "running"]);
+const SETTLED = new Set<RunState>(["idle", "failed", "timedout", "blocked", "stopped"]);
+const DEFAULT_EXECUTION_TIMEOUT_MS = 900_000;
+const MAX_WAIT_MS = 300_000;
+
+function shortId(): string {
+  return `run-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+}
+
+export function nextActionFor(state: RunState, needsStop: boolean): NextAction {
+  if (state === "starting" || state === "running") return "wait";
+  if (state === "idle") return needsStop ? "send" : "stop";
+  if (state === "failed" || state === "timedout" || state === "blocked") return "inspect/retry";
+  if (state === "stopped") return "stop";
+  return "stop";
+}
+
+export class SubagentRuntime {
+  private readonly catalog: ProfileCatalog;
+  private readonly parentSessionId: string;
+  private readonly transcriptRoot: string;
+  private readonly executable?: string;
+  private readonly createChild: typeof RpcChild.start;
+  private readonly now: () => number;
+  private readonly onChange: () => void;
+  private readonly closeViewer?: (runId: string) => Promise<void> | void;
+  private readonly defaultExecutionTimeoutMs: number;
+  private readonly runs = new Map<string, RunRecord>();
+  private readonly ownedTranscriptRoot: boolean;
+  private shuttingDown = false;
+
+  constructor(options: RuntimeOptions) {
+    this.catalog = options.catalog;
+    this.parentSessionId = options.parentSessionId;
+    this.executable = options.executable;
+    this.createChild = options.createChild ?? RpcChild.start.bind(RpcChild);
+    this.now = options.now ?? Date.now;
+    this.onChange = options.onChange ?? (() => {});
+    this.closeViewer = options.closeViewer;
+    this.defaultExecutionTimeoutMs = options.defaultExecutionTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
+    if (options.transcriptRoot) {
+      this.transcriptRoot = options.transcriptRoot;
+      mkdirSync(this.transcriptRoot, { recursive: true, mode: 0o700 });
+      this.ownedTranscriptRoot = false;
+    } else {
+      const base = join(tmpdir(), "pi-subagents");
+      mkdirSync(base, { recursive: true, mode: 0o700 });
+      this.transcriptRoot = mkdtempSync(join(base, `${this.parentSessionId.slice(0, 8)}-`));
+      this.ownedTranscriptRoot = true;
+    }
+  }
+
+  get transcriptDirectory(): string {
+    return this.transcriptRoot;
+  }
+
+  listOpen(): RunSnapshot[] {
+    return [...this.runs.values()]
+      .filter((run) => run.state !== "stopped")
+      .map((run) => this.snapshot(run));
+  }
+
+  listAll(): RunSnapshot[] {
+    return [...this.runs.values()].map((run) => this.snapshot(run));
+  }
+
+  get(id: string): RunSnapshot | undefined {
+    const run = this.runs.get(id);
+    return run ? this.snapshot(run) : undefined;
+  }
+
+  hasOpenRuns(): boolean {
+    return [...this.runs.values()].some((run) => run.state !== "stopped");
+  }
+
+  hasActiveRuns(): boolean {
+    return [...this.runs.values()].some((run) => ACTIVE.has(run.state));
+  }
+
+  async start(input: {
+    profile: ProfileName;
+    task: string;
+    cwd: string;
+    wait?: boolean;
+    executionTimeoutMs?: number;
+    parent: ParentLaunchSnapshot;
+    signal?: AbortSignal;
+  }): Promise<RunSnapshot> {
+    const profile = this.catalog[input.profile];
+    if (!profile) throw new Error(`Unknown profile: ${input.profile}`);
+    const id = shortId();
+    const runDir = join(this.transcriptRoot, id);
+    mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    const systemPromptFile = join(runDir, "system-prompt.md");
+    writeFileSync(systemPromptFile, `${profile.systemPrompt}\n`, { mode: 0o600 });
+    const transcriptPath = join(runDir, "transcript.txt");
+    const run: RunRecord = {
+      id,
+      profile: profile.name,
+      cwd: input.cwd,
+      state: "starting",
+      generation: 0,
+      transcriptPath,
+      systemPromptFile,
+      output: "",
+      partial: true,
+      queue: Promise.resolve(),
+    };
+    this.runs.set(id, run);
+    this.emitChange();
+    this.armExecutionTimeout(run, input.executionTimeoutMs ?? this.defaultExecutionTimeoutMs);
+
+    const boot = this.enqueue(run, async () => {
+      const child = await this.createChild({
+        executable: this.executable,
+        cwd: input.cwd,
+        systemPromptFile,
+        transcriptPath,
+        parent: input.parent,
+      }, {
+        onSettlement: (event) => this.handleSettlement(run, event),
+        onExit: () => this.handleExit(run),
+        onError: (error) => {
+          if (ACTIVE.has(run.state)) {
+            run.state = "failed";
+            run.error = error.message;
+            run.reason = error.message;
+            run.partial = false;
+            this.clearExecutionTimeout(run);
+            this.emitChange();
+          }
+        },
+      });
+      if (!ACTIVE.has(run.state)) {
+        await child.stop();
+        return;
+      }
+      run.child = child;
+      run.state = "running";
+      run.generation = 1;
+      this.emitChange();
+      await child.prompt(input.task);
+    });
+
+    boot.catch((error: Error) => {
+      run.state = "failed";
+      run.error = error.message;
+      run.reason = error.message;
+      run.partial = false;
+      this.clearExecutionTimeout(run);
+      this.emitChange();
+    });
+
+    if (!input.wait) {
+      await Promise.race([boot, Promise.resolve()]);
+      return this.snapshot(run);
+    }
+
+    return this.waitForRuns([id], undefined, input.signal).then((result) => {
+      const snap = result.runs.find((item) => item.id === id) ?? this.snapshot(run);
+      return snap;
+    });
+  }
+
+  async status(input: {
+    ids?: string[];
+    wait?: boolean;
+    waitTimeoutMs?: number;
+    signal?: AbortSignal;
+  } = {}): Promise<StatusResult> {
+    if (input.wait) {
+      if (!input.ids?.length) throw new Error("wait:true requires non-empty ids");
+      return this.waitForRuns(input.ids, input.waitTimeoutMs, input.signal);
+    }
+    if (!input.ids?.length) return { runs: this.listOpen() };
+    return {
+      runs: input.ids.map((id) => {
+        const run = this.runs.get(id);
+        if (!run) {
+          return {
+            id,
+            profile: "unknown",
+            state: "stopped" as const,
+            generation: 0,
+            cwd: "",
+            output: "",
+            partial: false,
+            error: "unknown run id",
+            reason: "unknown-run",
+            transcriptPath: "",
+            needsStop: false,
+            nextAction: "stop" as const,
+          };
+        }
+        return this.snapshot(run);
+      }),
+    };
+  }
+
+  async send(input: {
+    id: string;
+    message: string;
+    behavior?: "steer" | "follow-up";
+    wait?: boolean;
+    executionTimeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<RunSnapshot> {
+    const run = this.runs.get(input.id);
+    if (!run) throw new Error(`Unknown run id: ${input.id}`);
+    if (run.state === "stopped") throw new Error(`Run ${input.id} is stopped`);
+
+    const work = this.enqueue(run, async () => {
+      const child = run.child;
+      if (!child) throw new Error(`Run ${input.id} has no live child`);
+
+      if (ACTIVE.has(run.state) || child.isActive) {
+        if (!input.behavior) {
+          throw new Error("Active run requires behavior: \"steer\" or \"follow-up\"");
+        }
+        if (input.behavior === "steer") await child.steer(input.message);
+        else await child.followUp(input.message);
+        run.state = "running";
+        run.partial = true;
+        this.emitChange();
+        return;
+      }
+
+      if (run.state !== "idle") {
+        throw new Error(`Cannot send prompt while state is ${run.state}`);
+      }
+      if (input.behavior) {
+        throw new Error("behavior is only valid while a generation is running");
+      }
+      run.state = "running";
+      run.generation += 1;
+      run.output = "";
+      run.partial = true;
+      run.error = undefined;
+      run.reason = undefined;
+      this.armExecutionTimeout(run, input.executionTimeoutMs ?? this.defaultExecutionTimeoutMs);
+      this.emitChange();
+      await child.prompt(input.message);
+    });
+
+    if (!input.wait) {
+      await Promise.race([work, Promise.resolve()]);
+      return this.snapshot(run);
+    }
+    await Promise.race([work, Promise.resolve()]);
+    const waited = await this.waitForRuns([run.id], undefined, input.signal);
+    return waited.runs[0] ?? this.snapshot(run);
+  }
+
+  async stop(ids: string[]): Promise<StopResult[]> {
+    const results: StopResult[] = [];
+    for (const id of ids) {
+      results.push(await this.stopOne(id));
+    }
+    return results;
+  }
+
+  async stopActive(reason = "parent-abort"): Promise<StopResult[]> {
+    const activeIds = [...this.runs.values()]
+      .filter((run) => ACTIVE.has(run.state))
+      .map((run) => run.id);
+    const results: StopResult[] = [];
+    for (const id of activeIds) {
+      results.push(await this.stopOne(id, reason));
+    }
+    return results;
+  }
+
+  async shutdown(): Promise<{ transcriptDirectory?: string; retained: boolean }> {
+    this.shuttingDown = true;
+    const ids = [...this.runs.keys()];
+    for (const id of ids) {
+      await this.stopOne(id, "session-shutdown", true);
+    }
+    let retained = false;
+    for (const run of this.runs.values()) {
+      if (run.child && !run.child.hasExited) {
+        retained = true;
+        run.retainedTranscript = true;
+      }
+    }
+    if (!retained && this.ownedTranscriptRoot) {
+      try {
+        rmSync(this.transcriptRoot, { recursive: true, force: true });
+        return { retained: false };
+      } catch {
+        retained = true;
+      }
+    }
+    return {
+      retained,
+      ...(retained || !this.ownedTranscriptRoot ? { transcriptDirectory: this.transcriptRoot } : {}),
+    };
+  }
+
+  formatReminder(): string | undefined {
+    const open = this.listOpen();
+    if (!open.length) return undefined;
+    const lines = [
+      "Open subagent runs require explicit supervision before workflow completion:",
+      ...open.map((run) =>
+        `- ${run.id} [${run.profile}] state=${run.state} generation=${run.generation} cwd=${run.cwd} nextAction=${run.nextAction}`
+      ),
+      "Poll or wait with subagent_status, inspect every settled output, then subagent_stop each run. Async children do not wake the parent automatically.",
+    ];
+    return lines.join("\n");
+  }
+
+  private async stopOne(id: string, reason = "explicit-stop", includeIdle = true): Promise<StopResult> {
+    const run = this.runs.get(id);
+    if (!run) {
+      return { id, ok: false, error: "unknown run id" };
+    }
+    if (run.state === "stopped") {
+      return {
+        id,
+        ok: true,
+        state: "stopped",
+        transcriptPath: run.transcriptPath,
+        nextAction: "stop",
+      };
+    }
+    if (!includeIdle && !ACTIVE.has(run.state)) {
+      return {
+        id,
+        ok: true,
+        state: run.state,
+        transcriptPath: run.transcriptPath,
+        nextAction: nextActionFor(run.state, true),
+      };
+    }
+
+    this.clearExecutionTimeout(run);
+    try {
+      await this.closeViewer?.(id);
+    } catch {
+      // viewer cleanup is best-effort
+    }
+
+    try {
+      if (run.child) {
+        run.child.markStopRequested();
+        await run.child.stop();
+      }
+      run.state = "stopped";
+      run.reason = reason;
+      run.partial = false;
+      this.runs.delete(id);
+      this.emitChange();
+      return {
+        id,
+        ok: true,
+        state: "stopped",
+        transcriptPath: run.transcriptPath,
+        nextAction: "stop",
+      };
+    } catch (error) {
+      run.retainedTranscript = true;
+      run.error = error instanceof Error ? error.message : String(error);
+      this.emitChange();
+      return {
+        id,
+        ok: false,
+        error: run.error,
+        transcriptPath: run.transcriptPath,
+        retained: true,
+        nextAction: "retained-cleanup",
+      };
+    }
+  }
+
+  private async waitForRuns(
+    ids: string[],
+    waitTimeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<StatusResult> {
+    const timeout = waitTimeoutMs === undefined ? undefined : Math.min(Math.max(1, waitTimeoutMs), MAX_WAIT_MS);
+    const deadline = timeout === undefined ? undefined : this.now() + timeout;
+
+    const poll = async (): Promise<StatusResult> => {
+      while (true) {
+        if (signal?.aborted) {
+          await this.stopActive("wait-aborted");
+          return { runs: ids.map((id) => this.requiredSnapshot(id)) };
+        }
+        const snaps = ids.map((id) => this.requiredSnapshot(id));
+        if (snaps.every((snap) => SETTLED.has(snap.state))) {
+          return { runs: snaps };
+        }
+        if (deadline !== undefined && this.now() >= deadline) {
+          return { runs: snaps, waitTimedOut: true };
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    };
+
+    if (signal) {
+      return new Promise<StatusResult>((resolve, reject) => {
+        const onAbort = () => {
+          void this.stopActive("wait-aborted").finally(() => {
+            resolve({ runs: ids.map((id) => this.requiredSnapshot(id)) });
+          });
+        };
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+        poll().then((result) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(result);
+        }, (error) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        });
+      });
+    }
+    return poll();
+  }
+
+  private requiredSnapshot(id: string): RunSnapshot {
+    const run = this.runs.get(id);
+    if (!run) {
+      return {
+        id,
+        profile: "unknown",
+        state: "stopped",
+        generation: 0,
+        cwd: "",
+        output: "",
+        partial: false,
+        error: "unknown run id",
+        reason: "unknown-run",
+        transcriptPath: "",
+        needsStop: false,
+        nextAction: "stop",
+      };
+    }
+    return this.snapshot(run);
+  }
+
+  private snapshot(run: RunRecord): RunSnapshot {
+    const needsStop = run.state !== "stopped";
+    const output = run.child?.getBoundedAssistantText() || boundText(run.output);
+    return {
+      id: run.id,
+      profile: run.profile,
+      state: run.state,
+      generation: run.generation,
+      cwd: run.cwd,
+      output,
+      partial: run.partial || Boolean(run.child?.isPartialAssistant),
+      ...(run.error ? { error: run.error } : {}),
+      ...(run.reason ? { reason: run.reason } : {}),
+      transcriptPath: run.transcriptPath,
+      needsStop,
+      nextAction: run.retainedTranscript ? "retained-cleanup" : nextActionFor(run.state, needsStop),
+    };
+  }
+
+  private handleSettlement(run: RunRecord, event: SettlementEvent): void {
+    this.clearExecutionTimeout(run);
+    const state = event.classification.state === "stopped" && this.shuttingDown
+      ? "stopped"
+      : event.classification.state;
+    run.state = state;
+    run.output = event.assistantText;
+    run.partial = false;
+    run.reason = event.classification.reason;
+    if (state === "failed" || state === "timedout" || state === "blocked") {
+      run.error = event.classification.reason;
+    } else {
+      run.error = undefined;
+    }
+    this.emitChange();
+  }
+
+  private handleExit(run: RunRecord): void {
+    if (run.state === "stopped") return;
+    if (ACTIVE.has(run.state)) {
+      run.state = "blocked";
+      run.reason = "premature-exit";
+      run.error = "child exited before settlement";
+      run.partial = false;
+      this.clearExecutionTimeout(run);
+      this.emitChange();
+    }
+  }
+
+  private armExecutionTimeout(run: RunRecord, timeoutMs: number): void {
+    this.clearExecutionTimeout(run);
+    const ms = Math.max(1, timeoutMs);
+    run.executionDeadlineMs = this.now() + ms;
+    run.executionTimer = setTimeout(() => {
+      void this.onExecutionTimeout(run);
+    }, ms);
+  }
+
+  private clearExecutionTimeout(run: RunRecord): void {
+    if (run.executionTimer) clearTimeout(run.executionTimer);
+    run.executionTimer = undefined;
+    run.executionDeadlineMs = undefined;
+  }
+
+  private async onExecutionTimeout(run: RunRecord): Promise<void> {
+    if (!ACTIVE.has(run.state)) return;
+    if (run.child) {
+      run.child.markTimeoutRequested();
+      try {
+        await run.child.abort();
+      } catch {
+        // best effort
+      }
+    }
+    // If settlement never arrives (or child never started), force timedout.
+    setTimeout(() => {
+      if (ACTIVE.has(run.state)) {
+        run.state = "timedout";
+        run.reason = "timeout-without-settlement";
+        run.error = "execution timeout";
+        run.partial = false;
+        run.output = run.child?.latestAssistantText ?? run.output;
+        this.emitChange();
+      }
+    }, run.child ? 1_000 : 0);
+  }
+
+  private enqueue(run: RunRecord, work: () => Promise<void>): Promise<void> {
+    const next = run.queue.then(work, work);
+    run.queue = next.catch(() => {});
+    return next;
+  }
+
+  private emitChange(): void {
+    try {
+      this.onChange();
+    } catch {
+      // UI refresh must not break lifecycle
+    }
+  }
+}
+
+export function profileGuidance(catalog: ProfileCatalog): string {
+  return Object.values(catalog)
+    .map((profile: Profile) => `${profile.name} (${profile.description})`)
+    .join("; ");
+}
