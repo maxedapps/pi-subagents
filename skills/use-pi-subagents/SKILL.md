@@ -1,25 +1,30 @@
 ---
 name: use-pi-subagents
 description: >-
-  Pi extension launcher for bounded scout, research, and worker subagents via
-  subagent_start/status/send/stop. Use when on Pi with this extension active and
-  you need to launch, supervise, continue, or stop headless children. Apply
-  together with use-subagents policy. Do not use for recursive delegation,
-  ordinary background processes, or automatic Git/worktree management.
+  Orchestrates outsourcing of bounded scouting, research, and implementation to
+  headless Pi subagents via subagent_start/status/send/stop. Use this skill when
+  the parent should delegate substantive work, supervise it, and integrate the
+  results. Apply together with use-subagents policy. Do not use for recursive
+  delegation, duplicate parent/child execution, ordinary background processes,
+  or automatic Git/worktree management.
 license: MIT
 compatibility: >-
   Requires the @maxedapps/pi-subagents extension in the parent Pi session.
   Children self-disable the extension. Parent owns every workspace and Git
   operation. Complements use-subagents; does not replace it.
 metadata:
-  short-description: Four-tool Pi subagent launcher (with use-subagents policy)
+  short-description: Pi subagent outsourcing and orchestration
 ---
 
 # Use Pi Subagents
 
-**Four extension tools only.** Load/follow `use-subagents` for delegation, split, assignment shape, worktrees/Git, verify, workspace cleanup, and reporting.
+**Outsource execution; orchestrate in the parent.** Load/follow `use-subagents` for delegation, split, assignment shape, worktrees/Git, verify, workspace cleanup, and reporting.
 
-This skill is **how to start and supervise** children with:
+- Assign bounded, non-overlapping child scopes with explicit deliverables.
+- Do not perform a child-owned scope in the parent. Parent work is decomposition, supervision, focused verification, integration, or explicitly separate work.
+- If a child cannot finish, explicitly reclaim or reassign its scope before continuing it elsewhere.
+
+Use these four extension tools to start and supervise children:
 
 - `subagent_start`
 - `subagent_status`
@@ -54,7 +59,7 @@ User overrides: `~/.pi/agent/subagents/agents/*.md` (whole-file replace by `name
 
 ## Workflow
 
-1. Apply `use-subagents` (split, ownership, isolation, join points).
+1. Apply `use-subagents`: define child-owned scopes, parent orchestration/integration, isolation, and join points.
 2. Prepare each exact `cwd` (worktrees if needed) **in the parent**.
 3. Start:
    - Background (default): `subagent_start({ profile, task, cwd })`
@@ -67,7 +72,7 @@ User overrides: `~/.pi/agent/subagents/agents/*.md` (whole-file replace by `name
 5. Optional continue:
    - Idle follow-up (new generation): `subagent_send({ id, message })`
    - Active steer/follow-up: `subagent_send({ id, message, behavior: "steer"|"follow-up" })`
-6. Verify + integrate in the parent. Child claims are evidence, not acceptance.
+6. Verify with focused checks, then integrate. Follow up or reassign gaps; do not redo successful child work.
 7. Stop every run: `subagent_stop({ ids: […] })`
 8. Parent-owned worktree/branch cleanup per `use-subagents`.
 
