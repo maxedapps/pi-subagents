@@ -1,13 +1,8 @@
-# @maxedapps/pi-subagents
+# Pi Subagents
 
-Standalone Pi package that adds four headless subagent tools:
+Run **scout**, **research**, and **worker** children from a Pi parent session—without blocking the parent on every task.
 
-- `subagent_start`
-- `subagent_status`
-- `subagent_send`
-- `subagent_stop`
-
-Bundled profiles: **scout**, **research**, **worker**. Optional lazy Herdr transcript panes when Pi is already running inside Herdr.
+Install once. The parent agent gets four tools and a small UI. You supervise with status/wait/stop (children do **not** wake the parent automatically).
 
 ## Install
 
@@ -15,109 +10,145 @@ Bundled profiles: **scout**, **research**, **worker**. Optional lazy Herdr trans
 pi install npm:@maxedapps/pi-subagents
 ```
 
-Or link a local checkout:
+Requires **Node 22.19+** and **Pi 0.81.1+** (macOS/Linux).
 
-```bash
-pi install file:/path/to/pi-subagents
+Then start a new Pi session (or `/reload`).
+
+## What you get
+
+| Piece | Purpose |
+|---|---|
+| `subagent_start` | Launch one child |
+| `subagent_status` | List, snapshot, or wait until settled |
+| `subagent_send` | Follow up (idle) or steer (running) |
+| `subagent_stop` | Tear down runs when done |
+| Below-editor widget | Live open runs |
+| `/subagents` | Inspect readable transcripts (TUI) |
+
+**Profiles**
+
+| Profile | Best for |
+|---|---|
+| `scout` | Codebase questions, read-only inspection |
+| `research` | Repo + web research |
+| `worker` | One bounded implementation in a parent-supplied cwd |
+
+Children use the **parent’s model/thinking** and normally available tools/skills/extensions. They cannot start their own subagents. **You** own Git, worktrees, and integration.
+
+## Typical flow
+
+```text
+1. Prepare cwd (worktree if needed) in the parent
+2. subagent_start({ profile, task, cwd })          # async default
+3. subagent_status({ ids, wait: true })            # join when needed
+4. Inspect output / optional subagent_send
+5. subagent_stop({ ids })                          # always
 ```
-
-Requires Node.js 22.19+ and Pi 0.81.1+ on tested macOS/Linux.
-
-If you previously used the script-based `use-pi-subagents` skill under `~/.pi/agent/skills/`, remove or rename that skill directory. Pi keeps the first skill name winner, so the old skill can shadow this package skill.
-
-## Tools
 
 ### Start
 
-```ts
-// async (default)
-subagent_start({ profile: "scout", task: "Where is X defined?", cwd: "/repo" })
+```js
+// background (default)
+subagent_start({
+  profile: "scout",
+  task: "Where is auth middleware registered?",
+  cwd: "/path/to/repo",
+})
 
-// foreground join — still needs explicit stop afterward
-subagent_start({ profile: "worker", task: "Implement Y", cwd: "/repo/worktree", wait: true })
+// block until this run settles (still must stop afterward)
+subagent_start({
+  profile: "worker",
+  task: "Add validation to the signup form",
+  cwd: "/path/to/worktree",
+  wait: true,
+  executionTimeoutMs: 600000, // optional generation deadline
+})
 ```
 
-### Status / join
+### Status / wait
 
-```ts
-subagent_status({}) // list open runs
-subagent_status({ ids: ["run-…", "run-…"], wait: true }) // all-settled
-subagent_status({ ids: ["run-…"], wait: true, waitTimeoutMs: 5000 }) // may set waitTimedOut
+```js
+subagent_status({})                                 // all open runs
+subagent_status({ ids: ["run-…"] })                 // snapshot
+subagent_status({ ids: ["run-a", "run-b"], wait: true })
+subagent_status({ ids: ["run-…"], wait: true, waitTimeoutMs: 5000 })
+// waitTimeoutMs → may return waitTimedOut: true; children keep running
 ```
 
 ### Send
 
-```ts
-subagent_send({ id, message: "Also check tests" }) // idle → next generation
-subagent_send({ id, message: "Stop exploring; answer now", behavior: "steer" }) // active
+```js
+subagent_send({ id, message: "Also check the tests" })  // idle → next generation
+subagent_send({ id, message: "Answer now", behavior: "steer" })       // running
+subagent_send({ id, message: "…", behavior: "follow-up" })            // running queue
 ```
 
 ### Stop
 
-```ts
+```js
 subagent_stop({ ids: ["run-…", "run-…"] })
 ```
 
-**Async children do not wake the parent.** Always poll/join, inspect outputs, and stop every run.
+Unknown ids are skipped; others still stop.
 
-## Profiles
+## How to read results
 
-Markdown files with only:
+Every tool result includes roughly:
 
-```md
----
-name: scout
-description: Repository inspection and codebase questions
----
-System prompt body…
-```
+- `state` — `starting` · `running` · `idle` · `failed` · `timedout` · `blocked` · `stopped`
+- `output` — final or partial text
+- `transcriptPath` — full human log
+- `needsStop` — still must be stopped when true
+- `nextAction` — what to do next (`wait`, `send`, `inspect/retry`, `stop`, …)
 
-User overrides (whole-file replace by `name`):
+| State | Do this |
+|---|---|
+| `running` / `starting` | Wait or status-wait |
+| `idle` | Read handoff; optional send; then **stop** |
+| `failed` / `timedout` / `blocked` | Read error/output; **stop** |
+| `stopped` | Done for that run |
 
-`~/.pi/agent/subagents/agents/*.md`
-
-Children inherit the parent model/thinking and normally available approved tools, skills, and extensions. Launch intentionally does **not** pass `--tools`, `--no-skills`, `--no-extensions`, or `--no-approve`. The extension self-disables in children. Child sessions use `--no-session` and `--no-context-files`.
+**Rule:** never finish a workflow with open runs—`subagent_stop` everything you started.
 
 ## UI
 
-- Compact **below-editor** widget for open runs
-- `/subagents` selection overlay (TUI)
-- Enter → readable Pi detail overlay, or lazy Herdr `tail -n +1 -F <transcript>` split when `HERDR_ENV=1` and pane/workspace/tab/socket env are present
-- Viewer panes are read-only; communicate only through `subagent_send`
-- Herdr failure falls back to the Pi overlay and never affects the RPC child
+- **Widget** under the editor lists open runs.
+- **`/subagents`** (TUI): ↑↓ select · Enter inspect · `r` refresh · Esc close.
+- Inside **Herdr**, Enter can open a live transcript tail pane; elsewhere you get a Pi detail overlay. Viewers are read-only—use `subagent_send` to talk to the child.
 
-## Lifecycle and cleanup
+## Timeouts & Esc
 
-| Event | Behavior |
+| Control | Effect |
 |---|---|
-| Execution timeout | Aborts that generation → `timedout` |
-| Wait timeout | Returns current snapshots; children keep running |
-| Esc during blocking tool wait | Stops running runs in scope; idle survives |
-| Parent Esc | Stops running children; idle survives |
-| Session shutdown | Stops all open children, closes owned viewers, deletes transcript dir when safe |
-| Explicit `subagent_stop` | Stops requested runs; transcripts retained until shutdown |
+| `executionTimeoutMs` | Child generation deadline → `timedout` |
+| `waitTimeoutMs` | Your wait only; does **not** stop children |
+| Esc during a blocking tool | Stops **running** runs in that wait; idle runs stay |
+| Parent Esc | Stops running children; idle stays |
+| Quit / reload / new session | Stops **all** open children |
 
-Parent owns Git, branches, commits, worktrees, merges, and workspace cleanup. The bundled parent-only skill states this policy.
+## Custom profiles
 
-## Security / trust
+Add Markdown under:
 
-Children run with the same approved capability surface the parent would normally expose in non-interactive RPC, including trusted extensions and project resources allowed by the saved trust decision. Assign least scope in the task text and parent-prepared cwd. Do not treat child output as authoritative without parent verification.
-
-## Non-goals
-
-- Profile/runtime tool allowlists or model settings in profiles
-- Extension-managed Git/worktrees
-- Automatic result turns or automatic idle cleanup
-- Cross-session adoption/recovery, journals, control sockets
-- Windows/remote-Herdr viewer guarantees
-- Interactive input through viewer panes
-
-## Develop
-
-```bash
-npm install
-npm run check
+```text
+~/.pi/agent/subagents/agents/*.md
 ```
+
+```md
+---
+name: my-reviewer
+description: Focused PR review
+---
+Your system prompt…
+```
+
+Same `name` replaces a bundled profile. Only `name`, `description`, and the body are supported.
+
+## Safety
+
+- Children inherit approved parent capabilities (including project trust). Scope the **task** and **cwd** tightly.
+- Treat child output as evidence—verify in the parent before merging or shipping.
+- Parent owns every Git/worktree operation; children should not manage VCS.
 
 ## License
 

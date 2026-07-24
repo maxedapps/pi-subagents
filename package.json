@@ -9,6 +9,17 @@
     "subagents"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxedapps/pi-subagents.git"
+  },
+  "homepage": "https://github.com/maxedapps/pi-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/maxedapps/pi-subagents/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
