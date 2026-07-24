@@ -1,6 +1,6 @@
 {
   "name": "@maxedapps/pi-subagents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Standalone Pi extension for headless scout/research/worker subagents",
   "type": "module",
   "keywords": [
