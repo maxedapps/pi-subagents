@@ -24,9 +24,32 @@ function createFakePi() {
   const handlers = new Map<string, Handler[]>();
   const commands = new Map<string, Handler>();
   const widgets = new Map<string, unknown>();
+  const busListeners = new Map<string, Array<(data: unknown) => void>>();
+  let activeTools: string[] = ["read", "bash"];
   let thinking: string = "medium";
 
   const pi = {
+    events: {
+      emit(channel: string, data: unknown) {
+        for (const listener of [...(busListeners.get(channel) ?? [])]) listener(data);
+      },
+      on(channel: string, handler: (data: unknown) => void) {
+        const list = busListeners.get(channel) ?? [];
+        list.push(handler);
+        busListeners.set(channel, list);
+        return () => {
+          const current = busListeners.get(channel) ?? [];
+          busListeners.set(channel, current.filter((item) => item !== handler));
+        };
+      },
+    },
+    getActiveTools() {
+      return [...activeTools];
+    },
+    setActiveTools(names: string[]) {
+      activeTools = [...names];
+    },
+    busListeners,
     registerTool(def: { name: string; parameters: unknown; execute: Handler }) {
       tools.push(def);
     },

@@ -10,7 +10,7 @@ Install once. The parent agent gets four tools and a small UI. You supervise wit
 pi install npm:@maxedapps/pi-subagents
 ```
 
-Requires **Node 22.19+** and **Pi 0.81.1+** (macOS/Linux).
+Requires **Node 22.19+** and **Pi 0.82.0+** (macOS/Linux).
 
 Then start a new Pi session (or `/reload`).
 
@@ -143,6 +143,29 @@ Your system prompt…
 ```
 
 Same `name` replaces a bundled profile. Only `name`, `description`, and the body are supported.
+
+## Coexistence with Pi Office
+
+Pi Office is a separate product that manages its own agents through a durable
+runtime. While an Office holds a repository, **all** agent launching and control
+goes through its `office_agent_*` tools — there is no fallback, and this
+extension deliberately steps aside:
+
+- Pi Office asks this extension (0.2.0+) to suppress itself when an Office
+  activates; the `subagent_*` tools are removed from the active set and the
+  exact previous tool set is restored when the Office releases the window.
+- Every `subagent_*` call re-checks the Office policy marker at execution time
+  and **fails closed** — including for an Office in another Pi process, a
+  `failed`/`retained` Office, and a stale marker (that one asks you to run
+  `office_reconcile` rather than deleting anything).
+- Open runs are published to `<pi agent dir>/subagents/open-runs/<session>.json`
+  so an Office refuses to activate over live legacy runs instead of adopting
+  them. Stop your runs first, then create the Office.
+- Inside an Office-managed child (`PI_OFFICE_RUN_ID` present) this extension
+  registers nothing at all.
+
+Nothing changes when no Office is active, and this package has no dependency on
+Pi Office.
 
 ## Safety
 

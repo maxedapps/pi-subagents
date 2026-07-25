@@ -103,6 +103,20 @@ Every tool result includes `state`, `generation`, `profile`, `cwd`, output (comp
 - `/subagents` opens a selection overlay (TUI). Enter shows a readable live detail overlay, or lazily opens a Herdr `tail -F` transcript pane when already inside Herdr
 - Raw RPC JSONL is never shown
 
+## When a Pi Office is active
+
+If a Pi Office holds the repository, these tools are **not** the way to run agents.
+
+- The Office suppresses this extension and every `subagent_*` call fails closed
+  ("refusing to run …: Pi Office … is active"). This is intended, not a bug.
+- Launch, resume, and control agents **only** through the Office's
+  `office_agent_*` tools; never work around a refusal with `pi --mode rpc`,
+  scripts, or another subagent extension.
+- On a *stale* Office marker refusal, report it and run `office_reconcile` in
+  the Office. Never delete Office state to unblock yourself.
+- Before creating an Office, `subagent_stop` every open run: the Office refuses
+  to activate over live legacy runs and never adopts them.
+
 ## Non-goals
 
 - No extension-managed Git/worktrees

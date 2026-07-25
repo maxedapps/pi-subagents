@@ -1,6 +1,6 @@
 {
   "name": "@maxedapps/pi-subagents",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Standalone Pi extension for headless scout/research/worker subagents",
   "type": "module",
   "keywords": [
@@ -49,9 +49,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.81.1",
-    "@earendil-works/pi-coding-agent": "0.81.1",
-    "@earendil-works/pi-tui": "0.81.1",
+    "@earendil-works/pi-ai": "0.82.0",
+    "@earendil-works/pi-coding-agent": "0.82.0",
+    "@earendil-works/pi-tui": "0.82.0",
     "@types/node": "24.12.0",
     "tsx": "4.23.1",
     "typebox": "1.1.38",

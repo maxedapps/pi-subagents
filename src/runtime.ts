@@ -2,6 +2,11 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  getProcessStartIdentity,
+  type LegacyOpenRun,
+  type OpenRunRegistryWriter,
+} from "./office-compat.ts";
 import type { Profile, ProfileCatalog, ProfileName } from "./profiles.ts";
 import {
   boundText,
@@ -62,6 +67,15 @@ export interface RuntimeOptions {
   closeViewer?: (runId: string) => Promise<void> | void;
   defaultExecutionTimeoutMs?: number;
   stopGraceMs?: number;
+  /**
+   * Pi Office open-run registry (see office-compat.ts). When present, every
+   * live run is published to `<office home>/subagents/open-runs/<session>.json`
+   * so a Pi Office in ANOTHER process can see it and refuse to activate over
+   * it. Best effort by design: registry IO never breaks a run.
+   */
+  openRuns?: OpenRunRegistryWriter;
+  /** Injectable for tests; must produce the same identity strings Pi Office observes. */
+  processStartIdentity?: (pid: number) => Promise<string | null>;
 }
 
 interface RunRecord {
@@ -77,6 +91,9 @@ interface RunRecord {
   error?: string;
   reason?: string;
   child?: RpcChild;
+  pid?: number;
+  startIdentity?: string;
+  startedAt?: number;
   executionTimer?: ReturnType<typeof setTimeout>;
   executionDeadlineMs?: number;
   queue: Promise<void>;
@@ -110,6 +127,8 @@ export class SubagentRuntime {
   private readonly onChange: () => void;
   private readonly closeViewer?: (runId: string) => Promise<void> | void;
   private readonly defaultExecutionTimeoutMs: number;
+  private readonly openRuns: OpenRunRegistryWriter | undefined;
+  private readonly processStartIdentity: (pid: number) => Promise<string | null>;
   private readonly runs = new Map<string, RunRecord>();
   private readonly ownedTranscriptRoot: boolean;
   private shuttingDown = false;
@@ -123,6 +142,8 @@ export class SubagentRuntime {
     this.onChange = options.onChange ?? (() => {});
     this.closeViewer = options.closeViewer;
     this.defaultExecutionTimeoutMs = options.defaultExecutionTimeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS;
+    this.openRuns = options.openRuns;
+    this.processStartIdentity = options.processStartIdentity ?? ((pid) => getProcessStartIdentity(pid));
     if (options.transcriptRoot) {
       this.transcriptRoot = options.transcriptRoot;
       mkdirSync(this.transcriptRoot, { recursive: true, mode: 0o700 });
@@ -224,6 +245,11 @@ export class SubagentRuntime {
       run.state = "running";
       run.generation = 1;
       this.emitChange();
+      // Publish the live process to the Pi Office open-run registry as soon as
+      // it exists, so an Office activating in another process sees this run and
+      // refuses to activate over it. Deliberately not awaited: capturing the
+      // start identity execs `ps`, and run latency must not depend on it.
+      void this.recordOpenRun(run).catch(() => {});
       await child.prompt(input.task);
     });
 
@@ -361,6 +387,12 @@ export class SubagentRuntime {
     for (const id of ids) {
       await this.stopOne(id, "session-shutdown", true);
     }
+    // The registry describes runs owned by THIS session; the session is over.
+    try {
+      this.openRuns?.clear();
+    } catch {
+      // registry IO is best effort and must never break shutdown
+    }
     let retained = false;
     for (const run of this.runs.values()) {
       if (run.child && !run.child.hasExited) {
@@ -435,6 +467,7 @@ export class SubagentRuntime {
       run.reason = reason;
       run.partial = false;
       this.runs.delete(id);
+      this.syncOpenRuns();
       this.emitChange();
       return {
         id,
@@ -565,6 +598,9 @@ export class SubagentRuntime {
   }
 
   private handleExit(run: RunRecord): void {
+    // The process is gone: drop it from the open-run registry immediately
+    // rather than leaving an entry Pi Office would have to classify as stale.
+    this.syncOpenRuns();
     if (run.state === "stopped") return;
     if (ACTIVE.has(run.state)) {
       run.state = "blocked";
@@ -625,6 +661,53 @@ export class SubagentRuntime {
       this.onChange();
     } catch {
       // UI refresh must not break lifecycle
+    }
+  }
+
+  /**
+   * Capture the started child's pid + start identity and publish it. The
+   * identity string format is part of the Pi Office contract: Office
+   * re-observes the pid and compares the exact string, so a mismatch makes
+   * the entry read as stale rather than live.
+   */
+  private async recordOpenRun(run: RunRecord): Promise<void> {
+    const pid = run.child?.pid;
+    if (pid === undefined) return;
+    run.pid = pid;
+    run.startedAt = this.now();
+    try {
+      run.startIdentity = (await this.processStartIdentity(pid)) ?? undefined;
+    } catch {
+      run.startIdentity = undefined;
+    }
+    this.syncOpenRuns();
+  }
+
+  /**
+   * Rewrite the open-run registry from the live runs. Never throws: an
+   * unwritable registry must not break a run, and the Office policy marker
+   * remains the fail-closed defense in the other direction.
+   */
+  private syncOpenRuns(): void {
+    if (!this.openRuns) return;
+    const entries: LegacyOpenRun[] = [];
+    for (const run of this.runs.values()) {
+      if (run.pid === undefined || run.state === "stopped") continue;
+      if (run.child === undefined || run.child.hasExited) continue;
+      entries.push({
+        id: run.id,
+        pid: run.pid,
+        // A pid without a usable identity is recorded honestly: Pi Office
+        // then classifies it as stale (never as a verified live run).
+        startIdentity: run.startIdentity ?? `unavailable:pid=${run.pid}`,
+        profile: run.profile,
+        startedAt: run.startedAt ?? this.now(),
+      });
+    }
+    try {
+      this.openRuns.write(entries);
+    } catch {
+      // best effort
     }
   }
 }

@@ -1,6 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { createMarkerOnlyGuard, type OfficeToolGuard } from "./office-compat.ts";
 import type { ProfileCatalog, ProfileName } from "./profiles.ts";
 import type { ThinkingLevel } from "./rpc-child.ts";
 import { profileGuidance, type SubagentRuntime } from "./runtime.ts";
@@ -67,6 +68,14 @@ export function registerSubagentTools(
   pi: ExtensionAPI,
   runtime: SubagentRuntime | RuntimeRef,
   catalog: ProfileCatalog,
+  /**
+   * Pi Office coexistence guard. Every tool below re-checks it at EXECUTE
+   * time (not just at registration), so a stale tool call issued while a Pi
+   * Office holds the repository fails closed. The default is the marker-only
+   * guard: a caller that forgets to pass the handshake controller still gets
+   * the cross-process fail-closed check, never a weaker one.
+   */
+  officeGuard: OfficeToolGuard = createMarkerOnlyGuard(),
 ): void {
   const getRuntime = (): SubagentRuntime => {
     if (typeof (runtime as RuntimeRef).get === "function" && !("start" in runtime)) {
@@ -76,6 +85,22 @@ export function registerSubagentTools(
   };
   const startSchema = createStartSchema(catalog);
   const guidance = profileGuidance(catalog);
+  /**
+   * Paths a Pi Office policy window could cover for this call: the requested
+   * launch directory, the session's working directory, and this process's
+   * working directory. A marker held for any of them (or for a parent of any
+   * of them) refuses the call.
+   */
+  const guard = (
+    toolName: string,
+    ctx?: { cwd?: string },
+    launchCwd?: string,
+  ): Promise<void> =>
+    officeGuard.assertAllowed(toolName, [
+      ...(launchCwd ? [launchCwd] : []),
+      ...(ctx?.cwd ? [ctx.cwd] : []),
+      process.cwd(),
+    ]);
 
   pi.registerTool({
     name: "subagent_start",
@@ -87,6 +112,7 @@ export function registerSubagentTools(
       + "Parent owns Git/worktrees.",
     parameters: startSchema,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      await guard("subagent_start", ctx, params.cwd);
       return result(await getRuntime().start({
         profile: params.profile as ProfileName,
         task: params.task,
@@ -107,7 +133,8 @@ export function registerSubagentTools(
       + "wait requires non-empty ids. waitTimeoutMs expires with waitTimedOut:true and leaves children running. "
       + "Esc during wait stops only still-running runs in scope.",
     parameters: statusSchema,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      await guard("subagent_status", ctx);
       return result(await getRuntime().status({
         ...(params.ids ? { ids: params.ids } : {}),
         wait: params.wait === true,
@@ -124,7 +151,8 @@ export function registerSubagentTools(
       "Continue an idle run with a new generation prompt, or steer/follow-up an active generation. "
       + "Active sends require behavior: \"steer\" or \"follow-up\". Optional wait blocks for settlement.",
     parameters: sendSchema,
-    async execute(_toolCallId, params, signal) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      await guard("subagent_send", ctx);
       return result(await getRuntime().send({
         id: params.id,
         message: params.message,
@@ -143,7 +171,8 @@ export function registerSubagentTools(
       "Stop and remove each requested run independently. Closes owned viewer panes. "
       + "Transcripts remain until parent-session shutdown. Unknown ids do not block others.",
     parameters: stopSchema,
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      await guard("subagent_stop", ctx);
       return result(await getRuntime().stop(params.ids));
     },
   });

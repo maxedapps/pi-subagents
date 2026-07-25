@@ -1,9 +1,15 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 import { detectHerdrEnv, HerdrViewerManager } from "../../src/herdr.ts";
+import {
+  OfficeCompat,
+  officeChildEnvActive,
+  OpenRunRegistry,
+  resolveOfficeHome,
+} from "../../src/office-compat.ts";
 import { CHILD_ENV_MARKER, loadProfileCatalog } from "../../src/profiles.ts";
 import { SubagentRuntime } from "../../src/runtime.ts";
-import { registerSubagentTools } from "../../src/tools.ts";
+import { registerSubagentTools, TOOL_NAMES } from "../../src/tools.ts";
 import {
   DetailOverlay,
   formatWidgetLines,
@@ -33,11 +39,28 @@ export function isAbortedAssistantStop(messages: readonly EndMessage[]): boolean
 
 export default function subagentsExtension(pi: ExtensionAPI): void {
   if (process.env[CHILD_ENV_MARKER] === "1") return;
+  // Defense in depth: a Pi Office-managed child never loads legacy tooling
+  // (Office also launches its children with --no-extensions). Register nothing.
+  if (officeChildEnvActive(process.env)) return;
 
   const profiles = loadProfileCatalog();
+  const officeHome = resolveOfficeHome(process.env);
   let runtime: SubagentRuntime | undefined;
   let herdr: HerdrViewerManager | undefined;
+  let parentSessionId: string | undefined;
   let refreshWidget: () => void = () => {};
+
+  // Pi Office coexistence: the probe listener must exist from factory time,
+  // because Office waits exactly one macrotask for the reply before treating
+  // this extension as incompatible and refusing to activate.
+  const office = new OfficeCompat({
+    host: pi,
+    toolNames: TOOL_NAMES,
+    home: officeHome,
+    getOpenRunCount: () => runtime?.listOpen().length ?? 0,
+    getParentSessionId: () => parentSessionId ?? "unbound-session",
+  });
+  office.install();
 
   const runtimeRef = {
     get(): SubagentRuntime {
@@ -52,9 +75,11 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
       (command, args, options) => pi.exec(command, args, options),
       detectHerdrEnv(),
     );
+    parentSessionId = ctx.sessionManager.getSessionId();
     runtime = new SubagentRuntime({
       catalog: profiles,
-      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentSessionId,
+      openRuns: new OpenRunRegistry(officeHome, parentSessionId),
       onChange: () => refreshWidget(),
       closeViewer: async (runId) => {
         await herdr?.close(runId);
@@ -81,7 +106,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
     refreshWidget();
   }
 
-  registerSubagentTools(pi, runtimeRef, profiles);
+  registerSubagentTools(pi, runtimeRef, profiles, office);
   pi.on("resources_discover", () => ({ skillPaths: [skillPath] }));
 
   pi.on("session_start", (_event, ctx) => {
@@ -125,6 +150,7 @@ export default function subagentsExtension(pi: ExtensionAPI): void {
       if (ctx.hasUI) ctx.ui.setWidget(WIDGET_KEY, undefined);
       runtime = undefined;
       herdr = undefined;
+      parentSessionId = undefined;
       refreshWidget = () => {};
     }
   });
