@@ -46,14 +46,16 @@ function shortRunId(id: string): string {
 export function presentWidget(runs: readonly RunSnapshot[]): WidgetPresentation | undefined {
   const visible = runs.filter((run) => run.state !== "stopped");
   if (!visible.length) return undefined;
-  const active = visible.filter((run) => run.state === "starting" || run.state === "running").length;
+  const active = visible.filter((run) =>
+    run.state === "starting" || run.state === "running" || run.recovery?.state === "running"
+  ).length;
   const rows: WidgetRow[] = visible.map((run) => ({
     kind: "agent",
     profile: run.profile,
     id: shortRunId(run.id),
     generation: `g${run.generation}`,
-    phase: run.state,
-    tone: toneFor(run.state),
+    phase: run.recovery?.state === "running" ? "recovering" : run.state,
+    tone: run.recovery?.state === "running" ? "accent" : toneFor(run.state),
   }));
   return {
     header: `Subagents · ${active} active · ${visible.length - active} idle/settled`,
@@ -176,7 +178,8 @@ export class RunListOverlay implements Component {
         const absolute = this.offset + index;
         const run = visible[index]!;
         const marker = absolute === this.selected ? "▶" : " ";
-        const content = `${marker} ${run.profile.padEnd(PROFILE_WIDTH)} ${shortRunId(run.id)}  g${run.generation}  ${run.state}`;
+        const phase = run.recovery?.state === "running" ? "recovering" : run.state;
+        const content = `${marker} ${run.profile.padEnd(PROFILE_WIDTH)} ${shortRunId(run.id)}  g${run.generation}  ${phase}`;
         lines.push(row(` ${content}`, absolute === this.selected));
       }
     }
@@ -221,12 +224,25 @@ export class DetailOverlay implements Component {
       return this.theme.fg("border", "│") + padded + this.theme.fg("border", "│");
     };
     const transcript = readTranscriptTail(this.run.transcriptPath, 40);
+    const recovery = this.run.recovery;
+    const recoveryLines = recovery?.state === "succeeded"
+      ? [
+          row(` ${this.theme.fg("success", "Recovery summary")}`),
+          ...(recovery.summary ?? "").split(/\r?\n/).slice(0, 12).map((line) => row(` ${line}`)),
+          row(),
+        ]
+      : recovery?.state === "failed"
+        ? [row(` ${this.theme.fg("warning", `Recovery failed: ${recovery.error ?? "unknown error"}`)}`), row()]
+        : recovery?.state === "running"
+          ? [row(` ${this.theme.fg("accent", "Creating recovery summary…")}`), row()]
+          : [];
     const lines = [
       this.theme.fg("borderAccent", `╭${"─".repeat(innerWidth)}╮`),
       row(` ${this.theme.fg("accent", this.theme.bold(this.run.profile))} ${this.theme.fg("dim", this.run.id)}`),
       row(` ${this.theme.fg(toneFor(this.run.state), this.run.state)}  g${this.run.generation}  ${this.theme.fg("dim", this.run.cwd)}`),
       row(` ${this.theme.fg("dim", this.run.transcriptPath)}`),
       row(),
+      ...recoveryLines,
       ...transcript.map((line) => row(` ${line}`)),
       row(),
       row(` ${this.theme.fg("dim", "Enter/Esc close")}`),

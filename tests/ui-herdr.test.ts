@@ -29,12 +29,13 @@ function run(partial: Partial<RunSnapshot> & Pick<RunSnapshot, "id" | "profile" 
 test("widget presentation lists non-stopped runs and inspection hint", () => {
   const presentation = presentWidget([
     run({ id: "run-abc12345", profile: "scout", state: "running", generation: 2 }),
-    run({ id: "run-def67890", profile: "worker", state: "idle" }),
+    run({ id: "run-def67890", profile: "worker", state: "timedout", recovery: { state: "running" } }),
     run({ id: "run-zzz", profile: "research", state: "stopped" }),
   ]);
   assert.ok(presentation);
-  assert.match(presentation!.header, /1 active/);
+  assert.match(presentation!.header, /2 active/);
   assert.equal(presentation!.rows.length, 2);
+  assert.equal(presentation!.rows[1]?.phase, "recovering");
   assert.equal(presentation!.hint, "/subagents");
   const lines = formatWidgetLines([
     run({ id: "run-abc12345", profile: "scout", state: "running" }),
@@ -165,9 +166,19 @@ test("overlay selection components respond to keys", () => {
   overlay.handleInput("\r");
   assert.ok(actions.some((action: any) => action.type === "refresh" || action.type === "select"));
 
-  const detail = new DetailOverlay(runs[0]!, theme, () => actions.push({ type: "closed" }));
+  const detail = new DetailOverlay(
+    run({
+      id: "run-1",
+      profile: "scout",
+      state: "timedout",
+      recovery: { state: "succeeded", summary: "Recovered finding" },
+    }),
+    theme,
+    () => actions.push({ type: "closed" }),
+  );
   const rendered = detail.render(80);
   assert.ok(rendered.some((line) => line.includes("scout") || line.includes("run-1")));
+  assert.ok(rendered.some((line) => line.includes("Recovered finding")));
 });
 
 test("readTranscriptTail returns last lines only", async () => {

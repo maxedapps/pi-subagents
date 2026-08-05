@@ -25,6 +25,13 @@ export type RunState =
   | "stopped";
 
 export type NextAction = "wait" | "inspect/retry" | "send" | "stop" | "retained-cleanup";
+export type RecoveryState = "running" | "succeeded" | "failed";
+
+export interface RecoverySnapshot {
+  state: RecoveryState;
+  summary?: string;
+  error?: string;
+}
 
 export interface RunSnapshot {
   id: string;
@@ -36,6 +43,7 @@ export interface RunSnapshot {
   partial: boolean;
   error?: string;
   reason?: string;
+  recovery?: RecoverySnapshot;
   transcriptPath: string;
   needsStop: boolean;
   nextAction: NextAction;
@@ -96,6 +104,11 @@ interface RunRecord {
   startedAt?: number;
   executionTimer?: ReturnType<typeof setTimeout>;
   executionDeadlineMs?: number;
+  wrapUpTimer?: ReturnType<typeof setTimeout>;
+  recoveryTimer?: ReturnType<typeof setTimeout>;
+  recoveryState?: RecoveryState;
+  recoverySummary?: string;
+  recoveryError?: string;
   queue: Promise<void>;
   retainedTranscript?: boolean;
 }
@@ -103,10 +116,30 @@ interface RunRecord {
 const ACTIVE = new Set<RunState>(["starting", "running"]);
 const SETTLED = new Set<RunState>(["idle", "failed", "timedout", "blocked", "stopped"]);
 const DEFAULT_EXECUTION_TIMEOUT_MS = 900_000;
+const WRAP_UP_LEAD_MS = 60_000;
+const RECOVERY_TIMEOUT_MS = 60_000;
 const MAX_WAIT_MS = 300_000;
+
+const WRAP_UP_PROMPT =
+  "The execution deadline is approaching. Stop starting new work or research. "
+  + "Finish current tool calls, then return the best concise handoff you can from evidence already gathered, "
+  + "including findings/results, relevant paths or sources, validation, caveats, and unfinished work.";
+
+const RECOVERY_PROMPT =
+  "The previous attempt ended unexpectedly. Do not call tools or do more work. "
+  + "Using only the task and evidence already present in this conversation, return a concise recovery handoff "
+  + "covering findings/results, relevant paths or sources, validation performed, caveats, and unfinished work.";
 
 function shortId(): string {
   return `run-${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+}
+
+function isActive(run: RunRecord): boolean {
+  return ACTIVE.has(run.state) || run.recoveryState === "running";
+}
+
+function isSettledSnapshot(run: RunSnapshot): boolean {
+  return SETTLED.has(run.state) && run.recovery?.state !== "running";
 }
 
 export function nextActionFor(state: RunState, needsStop: boolean): NextAction {
@@ -180,7 +213,7 @@ export class SubagentRuntime {
   }
 
   hasActiveRuns(): boolean {
-    return [...this.runs.values()].some((run) => ACTIVE.has(run.state));
+    return [...this.runs.values()].some((run) => isActive(run));
   }
 
   async start(input: {
@@ -227,7 +260,9 @@ export class SubagentRuntime {
         onSettlement: (event) => this.handleSettlement(run, event),
         onExit: () => this.handleExit(run),
         onError: (error) => {
-          if (ACTIVE.has(run.state)) {
+          if (run.recoveryState === "running") {
+            this.failRecovery(run, error.message);
+          } else if (ACTIVE.has(run.state)) {
             run.state = "failed";
             run.error = error.message;
             run.reason = error.message;
@@ -372,7 +407,7 @@ export class SubagentRuntime {
 
   async stopActive(reason = "parent-abort"): Promise<StopResult[]> {
     const activeIds = [...this.runs.values()]
-      .filter((run) => ACTIVE.has(run.state))
+      .filter((run) => isActive(run))
       .map((run) => run.id);
     const results: StopResult[] = [];
     for (const id of activeIds) {
@@ -420,7 +455,9 @@ export class SubagentRuntime {
     const lines = [
       "Open subagent runs require explicit supervision before workflow completion:",
       ...open.map((run) =>
-        `- ${run.id} [${run.profile}] state=${run.state} generation=${run.generation} cwd=${run.cwd} nextAction=${run.nextAction}`
+        `- ${run.id} [${run.profile}] state=${run.state}`
+        + `${run.recovery ? ` recovery=${run.recovery.state}` : ""}`
+        + ` generation=${run.generation} cwd=${run.cwd} nextAction=${run.nextAction}`
       ),
       "Poll or wait with subagent_status, inspect every settled output, then subagent_stop each run. Async children do not wake the parent automatically.",
     ];
@@ -441,7 +478,7 @@ export class SubagentRuntime {
         nextAction: "stop",
       };
     }
-    if (!includeIdle && !ACTIVE.has(run.state)) {
+    if (!includeIdle && !isActive(run)) {
       return {
         id,
         ok: true,
@@ -452,6 +489,7 @@ export class SubagentRuntime {
     }
 
     this.clearExecutionTimeout(run);
+    this.clearRecoveryTimeout(run);
     try {
       await this.closeViewer?.(id);
     } catch {
@@ -506,7 +544,7 @@ export class SubagentRuntime {
           return { runs: ids.map((id) => this.requiredSnapshot(id)) };
         }
         const snaps = ids.map((id) => this.requiredSnapshot(id));
-        if (snaps.every((snap) => SETTLED.has(snap.state))) {
+        if (snaps.every(isSettledSnapshot)) {
           return { runs: snaps };
         }
         if (deadline !== undefined && this.now() >= deadline) {
@@ -563,7 +601,16 @@ export class SubagentRuntime {
 
   private snapshot(run: RunRecord): RunSnapshot {
     const needsStop = run.state !== "stopped";
-    const output = run.child?.getBoundedAssistantText() || boundText(run.output);
+    const output = run.recoveryState
+      ? boundText(run.output)
+      : run.child?.getBoundedAssistantText() || boundText(run.output);
+    const recovery = run.recoveryState
+      ? {
+          state: run.recoveryState,
+          ...(run.recoverySummary ? { summary: boundText(run.recoverySummary) } : {}),
+          ...(run.recoveryError ? { error: run.recoveryError } : {}),
+        }
+      : undefined;
     return {
       id: run.id,
       profile: run.profile,
@@ -571,16 +618,26 @@ export class SubagentRuntime {
       generation: run.generation,
       cwd: run.cwd,
       output,
-      partial: run.partial || Boolean(run.child?.isPartialAssistant),
+      partial: run.partial || run.recoveryState === "running" || (!run.recoveryState && Boolean(run.child?.isPartialAssistant)),
       ...(run.error ? { error: run.error } : {}),
       ...(run.reason ? { reason: run.reason } : {}),
+      ...(recovery ? { recovery } : {}),
       transcriptPath: run.transcriptPath,
       needsStop,
-      nextAction: run.retainedTranscript ? "retained-cleanup" : nextActionFor(run.state, needsStop),
+      nextAction: run.retainedTranscript
+        ? "retained-cleanup"
+        : run.recoveryState === "running"
+          ? "wait"
+          : nextActionFor(run.state, needsStop),
     };
   }
 
   private handleSettlement(run: RunRecord, event: SettlementEvent): void {
+    if (run.recoveryState === "running") {
+      this.handleRecoverySettlement(run, event);
+      return;
+    }
+
     this.clearExecutionTimeout(run);
     const state = event.classification.state === "stopped" && this.shuttingDown
       ? "stopped"
@@ -594,6 +651,64 @@ export class SubagentRuntime {
     } else {
       run.error = undefined;
     }
+
+    if (
+      (state === "failed" || state === "timedout" || state === "blocked")
+      && run.child
+      && !run.child.hasExited
+      && !this.shuttingDown
+    ) {
+      run.recoveryState = "running";
+      run.recoverySummary = undefined;
+      run.recoveryError = undefined;
+      this.emitChange();
+      void this.startRecovery(run);
+      return;
+    }
+    this.emitChange();
+  }
+
+  private handleRecoverySettlement(run: RunRecord, event: SettlementEvent): void {
+    this.clearRecoveryTimeout(run);
+    if (event.classification.state === "idle" && event.assistantText) {
+      run.recoveryState = "succeeded";
+      run.recoverySummary = event.assistantText;
+      run.recoveryError = undefined;
+    } else {
+      this.failRecovery(run, event.classification.reason);
+      return;
+    }
+    this.emitChange();
+  }
+
+  private async startRecovery(run: RunRecord): Promise<void> {
+    const child = run.child;
+    if (!child || child.hasExited || run.recoveryState !== "running") {
+      this.failRecovery(run, "child unavailable for recovery summary");
+      return;
+    }
+    this.armRecoveryTimeout(run);
+    try {
+      await child.prompt(RECOVERY_PROMPT);
+    } catch (error) {
+      if (child.isActive) {
+        child.markTimeoutRequested();
+        try {
+          await child.abort();
+        } catch {
+          // best effort
+        }
+      }
+      this.failRecovery(run, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private failRecovery(run: RunRecord, reason: string): void {
+    if (run.recoveryState !== "running") return;
+    this.clearRecoveryTimeout(run);
+    run.recoveryState = "failed";
+    run.recoverySummary = undefined;
+    run.recoveryError = reason;
     this.emitChange();
   }
 
@@ -602,6 +717,10 @@ export class SubagentRuntime {
     // rather than leaving an entry Pi Office would have to classify as stale.
     this.syncOpenRuns();
     if (run.state === "stopped") return;
+    if (run.recoveryState === "running") {
+      this.failRecovery(run, "child exited during recovery summary");
+      return;
+    }
     if (ACTIVE.has(run.state)) {
       run.state = "blocked";
       run.reason = "premature-exit";
@@ -616,6 +735,12 @@ export class SubagentRuntime {
     this.clearExecutionTimeout(run);
     const ms = Math.max(1, timeoutMs);
     run.executionDeadlineMs = this.now() + ms;
+    const wrapUpLead = Math.min(WRAP_UP_LEAD_MS, Math.floor(ms / 5));
+    if (wrapUpLead > 0) {
+      run.wrapUpTimer = setTimeout(() => {
+        void this.requestWrapUp(run);
+      }, ms - wrapUpLead);
+    }
     run.executionTimer = setTimeout(() => {
       void this.onExecutionTimeout(run);
     }, ms);
@@ -623,8 +748,46 @@ export class SubagentRuntime {
 
   private clearExecutionTimeout(run: RunRecord): void {
     if (run.executionTimer) clearTimeout(run.executionTimer);
+    if (run.wrapUpTimer) clearTimeout(run.wrapUpTimer);
     run.executionTimer = undefined;
+    run.wrapUpTimer = undefined;
     run.executionDeadlineMs = undefined;
+  }
+
+  private async requestWrapUp(run: RunRecord): Promise<void> {
+    if (!ACTIVE.has(run.state) || !run.child?.isActive) return;
+    try {
+      await run.child.steer(WRAP_UP_PROMPT);
+    } catch {
+      // The hard deadline remains the fallback if graceful steering races settlement.
+    }
+  }
+
+  private armRecoveryTimeout(run: RunRecord): void {
+    this.clearRecoveryTimeout(run);
+    run.recoveryTimer = setTimeout(() => {
+      void this.onRecoveryTimeout(run);
+    }, RECOVERY_TIMEOUT_MS);
+  }
+
+  private clearRecoveryTimeout(run: RunRecord): void {
+    if (run.recoveryTimer) clearTimeout(run.recoveryTimer);
+    run.recoveryTimer = undefined;
+  }
+
+  private async onRecoveryTimeout(run: RunRecord): Promise<void> {
+    if (run.recoveryState !== "running") return;
+    if (run.child) {
+      run.child.markTimeoutRequested();
+      try {
+        await run.child.abort();
+      } catch {
+        // best effort
+      }
+    }
+    setTimeout(() => {
+      if (run.recoveryState === "running") this.failRecovery(run, "recovery summary timeout");
+    }, 1_000);
   }
 
   private async onExecutionTimeout(run: RunRecord): Promise<void> {

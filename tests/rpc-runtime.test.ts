@@ -91,8 +91,22 @@ test("classifyAssistant maps stop/error/abort/timeout evidence", () => {
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "stop", content: "ok" }).state, "idle");
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "stop", content: "" }).state, "blocked");
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "error", errorMessage: "boom" }).state, "failed");
+  assert.equal(
+    classifyAssistant(
+      { role: "assistant", stopReason: "error", errorMessage: "Request was aborted" },
+      { timeoutRequested: true },
+    ).state,
+    "timedout",
+  );
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "aborted" }, { timeoutRequested: true }).state, "timedout");
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "aborted" }, { stopRequested: true }).state, "stopped");
+  assert.equal(
+    classifyAssistant(
+      { role: "assistant", stopReason: "error", errorMessage: "Request was aborted" },
+      { stopRequested: true },
+    ).state,
+    "stopped",
+  );
   assert.equal(classifyAssistant({ role: "assistant", stopReason: "aborted" }).state, "blocked");
   assert.equal(classifyAssistant(null).state, "blocked");
 });
@@ -191,6 +205,7 @@ test("runtime start async/sync, multi-wait, send, stop, timeouts, and esc scope"
     active: boolean;
     timeout: boolean;
     stopFlag: boolean;
+    recoveryShouldFail: boolean;
     listeners: Array<(event: unknown) => void>;
     text: string;
   }>();
@@ -206,6 +221,7 @@ test("runtime start async/sync, multi-wait, send, stop, timeouts, and esc scope"
       active: false,
       timeout: false,
       stopFlag: false,
+      recoveryShouldFail: false,
       listeners: [] as Array<(event: unknown) => void>,
       text: "",
     };
@@ -220,7 +236,21 @@ test("runtime start async/sync, multi-wait, send, stop, timeouts, and esc scope"
       async prompt(message: string) {
         state.promptCount += 1;
         state.active = true;
+        state.timeout = false;
+        state.stopFlag = false;
         state.text = "";
+        if (message.includes("fail recovery")) state.recoveryShouldFail = true;
+        if (message.startsWith("The previous attempt") && state.recoveryShouldFail) {
+          queueMicrotask(() => {
+            state.active = false;
+            events.onSettlement?.({
+              classification: { state: "failed", reason: "recovery-error", text: "" },
+              assistantText: "",
+              partial: false,
+            });
+          });
+          return;
+        }
         if (message.includes("fail")) {
           queueMicrotask(() => {
             state.active = false;
@@ -339,6 +369,19 @@ test("runtime start async/sync, multi-wait, send, stop, timeouts, and esc scope"
 
     const failed = await runtime.start({ profile: "scout", task: "please fail", cwd: root, wait: true, parent: {} });
     assert.equal(failed.state, "failed");
+    assert.equal(failed.recovery?.state, "succeeded");
+    assert.match(failed.recovery?.summary ?? "", /done:The previous attempt ended unexpectedly/);
+
+    const failedRecovery = await runtime.start({
+      profile: "scout",
+      task: "please fail recovery",
+      cwd: root,
+      wait: true,
+      parent: {},
+    });
+    assert.equal(failedRecovery.state, "failed");
+    assert.deepEqual(failedRecovery.recovery, { state: "failed", error: "recovery-error" });
+    assert.equal(failedRecovery.nextAction, "inspect/retry");
 
     // execution timeout
     const timeoutRun = await runtime.start({
@@ -356,6 +399,9 @@ test("runtime start async/sync, multi-wait, send, stop, timeouts, and esc scope"
       await new Promise((r) => setTimeout(r, 1200));
     }
     assert.equal(runtime.get(timeoutRun.id)?.state, "timedout");
+    assert.equal(runtime.get(timeoutRun.id)?.recovery?.state, "succeeded");
+    const timedOutChild = [...children.values()].find((item) => item.abortCount > 0);
+    assert.equal(timedOutChild?.steerCount, 1, "deadline should request a graceful wrap-up before aborting");
 
     // Esc-style active-only stop preserves idle
     const keepIdle = await runtime.start({ profile: "scout", task: "keep", cwd: root, wait: true, parent: {} });

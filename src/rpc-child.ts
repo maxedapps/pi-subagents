@@ -109,16 +109,19 @@ export function classifyAssistant(
   const errorMessage = typeof (message as { errorMessage?: unknown }).errorMessage === "string"
     ? (message as { errorMessage: string }).errorMessage
     : null;
+  const abortLike = stopReason === "aborted" || Boolean(errorMessage?.toLowerCase().includes("abort"));
+  // Pi may surface an RPC abort as stopReason="error" with "Request was aborted".
+  // Prefer the cause known by this runtime over that generic provider shape.
+  if (abortLike && context.timeoutRequested) {
+    return { state: "timedout", reason: "timeout-abort", text, stopReason: String(stopReason) };
+  }
+  if (abortLike && context.stopRequested) {
+    return { state: "stopped", reason: "explicit-stop-abort", text, stopReason: String(stopReason) };
+  }
   if (stopReason === "error" || errorMessage) {
     return { state: "failed", reason: errorMessage || "assistant-error", text, stopReason: String(stopReason) };
   }
   if (stopReason === "aborted") {
-    if (context.timeoutRequested) {
-      return { state: "timedout", reason: "timeout-abort", text, stopReason: "aborted" };
-    }
-    if (context.stopRequested) {
-      return { state: "stopped", reason: "explicit-stop-abort", text, stopReason: "aborted" };
-    }
     return { state: "blocked", reason: "spontaneous-abort", text, stopReason: "aborted" };
   }
   if (stopReason === "length") return { state: "blocked", reason: "length", text, stopReason: "length" };

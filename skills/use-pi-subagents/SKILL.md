@@ -80,7 +80,7 @@ User overrides: `~/.pi/agent/subagents/agents/*.md` (whole-file replace by `name
 
 | Control | Effect |
 |---|---|
-| `executionTimeoutMs` on start/send | Child generation execution deadline. Timeout aborts that generation → `timedout`. |
+| `executionTimeoutMs` on start/send | Near the deadline the child is steered to wrap up; the hard deadline aborts → `timedout`, followed by a short best-effort recovery-summary attempt. Omit it for the 15-minute default; allow 10–15 minutes for deep research. |
 | `waitTimeoutMs` on status | Caller wait only. Never stops children. |
 | Esc during blocking start/send/status | Stops **running** runs in that wait scope only. Already-idle runs survive. |
 | Parent Esc (`agent_end` aborted) | Stops currently running children; preserves idle output. |
@@ -88,13 +88,13 @@ User overrides: `~/.pi/agent/subagents/agents/*.md` (whole-file replace by `name
 
 ## Result handling
 
-Every tool result includes `state`, `generation`, `profile`, `cwd`, output (complete or partial), `error`/`reason` when present, `transcriptPath`, `needsStop`, and `nextAction`:
+Every tool result includes `state`, `generation`, `profile`, `cwd`, output (complete or partial), `error`/`reason` when present, `transcriptPath`, `needsStop`, and `nextAction`. Abnormal settlement may also include `recovery.state` plus a best-effort `recovery.summary` or `recovery.error`:
 
 | State | Typical nextAction |
 |---|---|
 | `starting` / `running` | `wait` |
 | `idle` | inspect handoff; optional `send`; then `stop` |
-| `failed` / `timedout` / `blocked` | `inspect/retry` then `stop` |
+| `failed` / `timedout` / `blocked` | inspect error/output and any recovery summary; `inspect/retry` then `stop` |
 | retained cleanup ambiguity | `retained-cleanup` — report path; do not invent recovery |
 
 ## UI

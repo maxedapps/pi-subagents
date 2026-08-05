@@ -97,6 +97,7 @@ Every tool result includes roughly:
 
 - `state` — `starting` · `running` · `idle` · `failed` · `timedout` · `blocked` · `stopped`
 - `output` — final or partial text
+- `recovery` — on abnormal settlement, best-effort recovery state plus summary or error
 - `transcriptPath` — full human log
 - `needsStop` — still must be stopped when true
 - `nextAction` — what to do next (`wait`, `send`, `inspect/retry`, `stop`, …)
@@ -105,7 +106,7 @@ Every tool result includes roughly:
 |---|---|
 | `running` / `starting` | Wait or status-wait |
 | `idle` | Read handoff; optional send; then **stop** |
-| `failed` / `timedout` / `blocked` | Read error/output; **stop** |
+| `failed` / `timedout` / `blocked` | Read error/output and any `recovery.summary`; **stop** |
 | `stopped` | Done for that run |
 
 **Rule:** never finish a workflow with open runs—`subagent_stop` everything you started.
@@ -120,11 +121,13 @@ Every tool result includes roughly:
 
 | Control | Effect |
 |---|---|
-| `executionTimeoutMs` | Child generation deadline → `timedout` |
+| `executionTimeoutMs` | Near the deadline, asks the child to wrap up; at the deadline, hard-aborts → `timedout`. A short recovery-summary attempt may follow. |
 | `waitTimeoutMs` | Your wait only; does **not** stop children |
 | Esc during a blocking tool | Stops **running** runs in that wait; idle runs stay |
 | Parent Esc | Stops running children; idle stays |
 | Quit / reload / new session | Stops **all** open children |
+
+Deep research often needs 10–15 minutes; omitting `executionTimeoutMs` uses the 15-minute default. Recovery is best effort: provider/auth/process failures can also prevent the summary call.
 
 ## Custom profiles
 

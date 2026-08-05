@@ -107,7 +107,8 @@ export function registerSubagentTools(
     label: "Start subagent",
     description:
       `Start one headless Pi subagent. Profiles: ${guidance}. `
-      + "Async is default. wait:true blocks until that run settles and still returns needsStop:true. "
+      + "Async is default. wait:true blocks through any recovery-summary attempt and still returns needsStop:true. "
+      + "Execution deadlines request a concise wrap-up before hard abort; abnormal settlement may include recovery.summary. "
       + "Children do not wake the parent automatically — poll/join with subagent_status and always subagent_stop when done. "
       + "Parent owns Git/worktrees.",
     parameters: startSchema,
@@ -129,7 +130,8 @@ export function registerSubagentTools(
     name: "subagent_status",
     label: "Subagent status",
     description:
-      "List open runs, snapshot selected ids, or wait:true until every selected id settles (all-settled, no fail-fast). "
+      "List open runs, snapshot selected ids, or wait:true until every selected id settles, including recovery-summary attempts (all-settled, no fail-fast). "
+      + "Abnormal runs may include recovery.state, recovery.summary, or recovery.error. "
       + "wait requires non-empty ids. waitTimeoutMs expires with waitTimedOut:true and leaves children running. "
       + "Esc during wait stops only still-running runs in scope.",
     parameters: statusSchema,
